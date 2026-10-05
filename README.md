@@ -648,7 +648,7 @@ curl -sS http://localhost:8000/snapshot-withdrawal-plans/<PLAN_ID> \
   - **受控申请提交** `POST /records/{id}/publish-requests`：按拟发布历史版本的原文与区间核验，不通过则**不产生待审申请**；
   - **受控申请批准** `POST /publish-requests/{id}/approve`：除既有检查外，用**批准当时启用的清单**对**申请冻结的原文与区间**重新核验（等待复核期间清单可能已变更）；不通过则**不产生快照或令牌，申请保持待审且仍可驳回**。
   - 共享凭证申请/批准不再重复核验：它们引用的是**已发布快照的脱敏正文**，发布当时已核验。
-- **并发一致性**：发布（提交/批准）事务先对清单单行 `SELECT … FOR UPDATE` 加锁并在锁内完成核验，行锁持有到本次提交。与清单替换并发时由同一把行锁串行化，保证**发布按同一已提交清单版本完成核验和提交**——替换先提交则发布在获锁后按新清单核验，发布先提交则本次不受替换影响。加锁顺序恒为“清单行 → 快照行”，与库内其他事务同序，不会死锁。
+- **并发一致性**：发布（提交/批准）事务先对清单单行 `SELECT … FOR UPDATE` 加锁并在锁内完成核验，行锁持有到本次提交。与清单替换并发时由同一把行锁串行化，保证**发布按同一已提交清单版本完成核验和提交**——替换先提交则发布在获锁后按新清单核验，发布先提交则本次不受替换影响。加锁顺序恒为“清单行 → 快照行”（受控提交完整锁序为“版本行 → 清单行 → 快照行”，受控批准为“申请行 → 清单行 → 快照行”，直接发布为“版本行 → 清单行 → 快照行”），与库内其他事务同序，不会死锁（详见“受控提交与批准并发的锁序修正”）。
 - **失败响应（不泄露内容）**：核验失败统一 `422`，且**只向有权调用方**（服务密钥的直接发布、持个人凭据的提交/批准）返回**未覆盖命中的码点区间**，**绝不回显任何短语或原文**：
   ```json
   {"detail": {"message": "sensitive phrase hits are not fully covered by redaction intervals",
@@ -730,7 +730,7 @@ curl -sS "$BASE/public/snapshots/<SID>?token=<TOKEN>"
 ### 语义与规则
 
 1. **标记受控**：机构凭服务密钥 `PUT /records/{id}/controlled`（幂等）。受控记录的直接发布请求返回 `409`；非受控记录的受控申请同样返回 `409`（引导使用正确入口）。
-2. **提交申请**：具备 `operator` 角色者用**本人凭据** `POST /records/{id}/publish-requests`，指定一个**历史版本**（`version`，可带 `expires_in_seconds`/`expires_at`、可选正整数 `max_reads` 与可选外部阅览时段 `window_open_at`/`window_close_at`，规则与直接发布一致）。申请在提交时**冻结该版本的原文与敏感区间、读取次数上限与外部阅览时段**，后续修订只产生新版本，不改变待审内容、上限与时段。
+2. **提交申请**：具备 `operator` 角色者用**本人凭据** `POST /records/{id}/publish-requests`，指定一个**历史版本**（`version`，可带 `expires_in_seconds`/`expires_at`、可选正整数 `max_reads` 与可选外部阅览时段 `window_open_at`/`window_close_at`，规则与直接发布一致）。申请在提交时**冻结该版本的原文与敏感区间、读取次数上限与外部阅览时段**，后续修订只产生新版本，不改变待审内容、上限与时段。提交事务的行锁序恒为“**版本行 → 敏感短语清单行 → 快照行**”（在锁定的同一已提交清单版本内核验原文与遮蔽区间并冻结内容），与批准、直接发布同序；同一快照上的新申请提交与另一待审申请的批准并发时**不会死锁**（详见下文“受控提交与批准并发的锁序修正”）。
 3. **复核**：具备 `reviewer` 角色的**另一人**批准或驳回：
    - **申请人不得复核**自己的申请（即使其同时拥有 reviewer 角色）→ `403`；
    - 批准与驳回互斥：驳回后不能批准、批准后不能再驳回；对已终结申请再次操作 → `409`；
@@ -817,6 +817,69 @@ curl -sS http://localhost:8000/records/<RID>/publish-requests -u alice:alice-pw
 | 申请人复核自己的申请 | `403` |
 | 未知记录 / 版本 / 申请 | `404` |
 | 受控记录直接发布、非受控记录提交申请、对已终结申请再操作、提交/批准命中已撤回版本（含批准等待行锁期间定时计划到点）、批准时冻结时段已截止（含等待行锁跨过截止）、令牌到期时间非法 | `409` / `422` |
+
+## 受控提交与批准并发的锁序修正（同一快照不得死锁）
+
+**问题**：在一份**已有快照**的受控记录上，新申请的“提交”与另一份待审申请的“批准”可能并发。修复前两条既有流程对**敏感短语清单行**与**快照行**的加锁顺序相反：
+
+| 流程 | 修复前锁序（相关部分） |
+| --- | --- |
+| 提交 `POST /records/{id}/publish-requests` | 版本行 → **快照行 → 清单行**（先锁快照检查撤回，再锁清单核验） |
+| 批准 `POST /publish-requests/{id}/approve` | 申请行 → **清单行 → 快照行** |
+
+并发交错时（提交持有快照行等清单行、批准持有清单行等快照行）双方相互等待，PostgreSQL 检出死锁后中止其中一个事务——原本合法的提交或批准以 `500` 失败。
+
+**修复（仅调整两条既有流程的加锁顺序，语义与错误口径全部不变）**：
+
+- 三条签发/提交流程现在共用同一把锁序尺度：
+  - **受控提交**：版本行 → **清单行 → 快照行**；
+  - **受控批准**：申请行 → **清单行 → 快照行**（原本就是该顺序，未改动）；
+  - **直接发布**：版本行 → **清单行 → 快照行**（原本就是该顺序，未改动）。
+- 同一快照上的提交与批准并发时，后到者只在清单行（随后在快照行）上排队，先到者提交释放后顺序完成，**不再有锁序环、不再死锁**。
+- **提交仍按同一已提交清单版本核验原文及遮蔽区间并冻结内容**：清单行锁在核验与整个提交期间持有，命中未被完整遮蔽仍返回既有 `422`（只回未覆盖命中码点，不回显短语/原文），整次回滚——**不留下申请、快照或令牌的半成品**。
+- **批准仍按当时启用的清单重新核验**申请冻结的原文与区间（清单可能在其等待行锁期间被替换），不通过仍 `422`、申请保持待审可驳回；定时撤回计划到点、冻结时段截止等“先取锁、后取时”的时刻判定与处理顺序均不变。
+- **已撤回快照**（含等待期间到点的定时计划）仍先在快照行锁内按**预定时刻与计划原因**结算到点计划、随该判定一并提交落库，再沿用既有 `409` 拒绝；**版本原文已销毁**（版本行或申请冻结原文为 NULL）仍沿用既有 `409`；这些失败路径同样不产生申请、快照或令牌。
+- 无冲突时**成功响应、鉴权（服务密钥 / HTTP Basic）与公开读取约定完全不变**；启动方式、环境变量与数据库升级链（仍为 v8，**无结构变更**）不变。
+
+### 调用示例
+
+```bash
+# 前置：受控记录的版本 1 已有一份快照（经申请 PR1 批准产生 <SID>）
+curl -sS -X POST http://localhost:8000/publish-requests/<PR1>/approve -u bob:bob-pw
+# => 200 {"snapshot_id":"<SID>", ...}
+
+# 再造一份待审申请 PR_A；然后让“批准 PR_A”与“提交同版本新申请”并发交错：
+TMP=$(mktemp -d)
+(curl -sS -o "$TMP/a.out" -w '%{http_code}' -X POST \
+  http://localhost:8000/publish-requests/<PR_A>/approve -u bob:bob-pw > "$TMP/a.code") &
+sleep 0.2   # 让批准先持有清单行，制造最坏交错
+(curl -sS -o "$TMP/s.out" -w '%{http_code}' -X POST \
+  http://localhost:8000/records/<RID>/publish-requests \
+  -u alice:alice-pw -H 'Content-Type: application/json' \
+  -d '{"version":1,"max_reads":5}' > "$TMP/s.code") &
+wait
+# 修复前：其中一个返回 500（deadlock detected）；修复后：
+printf '批准 HTTP %s（200），提交 HTTP %s（201）\n' "$(cat "$TMP/a.code")" "$(cat "$TMP/s.code")"
+# 终态：同一 (记录,版本) 仍只有一份快照；新申请保持 pending 且可被正常批准；
+#       两笔成功操作各签发一枚立即可用的令牌。
+curl -sS http://localhost:8000/records/<RID> -H "X-Service-Key: dev-service-key-change-me" | jq .
+```
+
+并发锁序的确定性集成测试（真实 PostgreSQL 行锁等待：插桩制造“提交持快照行等清单行、批准持清单行等快照行”的最坏交错）由 `ControlledPublishIntegrationTests` 覆盖：
+
+```bash
+python3 -m unittest \
+  tests.test_integration_api.ControlledPublishIntegrationTests.\
+test_concurrent_submit_and_approve_on_same_snapshot_do_not_deadlock \
+  tests.test_integration_api.ControlledPublishIntegrationTests.\
+test_repeated_concurrent_submit_approve_pairs_all_succeed -v
+```
+
+仅用 HTTP API 的可运行演示（受控提交与批准并发不再死锁、终态唯一、新申请无半成品且可继续批准、已撤回快照仍 409）：
+
+```bash
+./examples/demo_lock_order.sh   # 可用 BASE_URL / SERVICE_KEY / ALICE_PW / BOB_PW 覆盖
+```
 
 ## 多快照共享凭证（一次把多个快照交给同一外部审阅者）
 

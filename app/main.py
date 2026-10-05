@@ -359,8 +359,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Redacted Records API",
-    version="1.12.0",
-    summary="机构公开脱敏记录服务（受控发布 + 读取次数上限 + 快照撤回 + 快照定时撤回 + 多快照共享凭证 + 泄露换发 + 成功读取审计 + 记录临时冻结 + 敏感短语清单核验 + 快照外部阅览时段 + 历史版本原文销毁 + 直接发布签发时刻修正 + 版本化数据库升级）",
+    version="1.13.0",
+    summary="机构公开脱敏记录服务（受控发布 + 读取次数上限 + 快照撤回 + 快照定时撤回 + 多快照共享凭证 + 泄露换发 + 成功读取审计 + 记录临时冻结 + 敏感短语清单核验 + 快照外部阅览时段 + 历史版本原文销毁 + 直接发布签发时刻修正 + 受控提交/批准锁序修正 + 版本化数据库升级）",
     lifespan=lifespan,
 )
 
@@ -442,25 +442,6 @@ def _verify_against_settings(
                 "hits": [{"start": s, "end": e} for s, e in uncovered],
             },
         )
-
-
-def _verify_phrases_cover_text(
-    db: Session, text: str, intervals: list[tuple[int, int]]
-) -> SensitivePhraseSettings:
-    """按当前启用清单核验原文：每个区分大小写的字面量命中都须被遮蔽区间完整覆盖。
-
-    先锁定清单单行（固定锁序的第一把锁）再在锁内核验，行锁持有至本次事务
-    提交/回滚，保证核验与提交对应同一已提交清单版本。核验失败统一 422 并回滚：
-    绝不回显任何短语或原文，且不产生快照、令牌或改变申请状态。返回锁定的
-    清单行，供需要在同一把锁后继续加其他行锁的调用方复用。
-    """
-    settings_row = _lock_sensitive_phrase_settings(db)
-    try:
-        _verify_against_settings(settings_row, text, intervals)
-    except HTTPException:
-        db.rollback()
-        raise
-    return settings_row
 
 
 def _request_info(request: PublishRequestModel) -> PublishRequestInfo:
@@ -935,6 +916,15 @@ def submit_publish_request(
     均省略表示不携带时段。批准时若冻结时段的截止已到则拒绝批准（409），申请仍
     待审、可驳回；批准签发时若申请时段与快照首次发布已有时段不一致则整次批准
     失败，绝不改写快照。
+
+    行锁序恒为“版本行 -> 敏感短语清单行 -> 快照行”：清单行锁先于快照行锁获取，
+    与直接发布（版本行 -> 清单行 -> 快照行）及受控批准（申请行 -> 清单行 ->
+    快照行）严格同序。同一快照上的新申请提交与另一申请的批准并发时，双方只在
+    清单行/快照行上排队，绝不形成“持快照行等清单行、持清单行等快照行”的交叉
+    等待，原本合法的提交与批准不会再因数据库死锁而失败。提交仍在锁定的同一
+    已提交清单版本上核验拟发布版本原文与遮蔽区间并冻结内容（命中未完整覆盖
+    沿用既有 422，不产生申请、快照或令牌）；已撤回快照（含在快照行锁内先按
+    预定时刻/计划原因结算的到点计划）沿用既有 409，版本原文已销毁沿用 409。
     """
     # 记录永不删除：普通读判定存在性即可（不加行锁，避免与公开读取
     # “快照行 → 记录行”锁序引入新的交叉锁序环）。
@@ -967,7 +957,13 @@ def submit_publish_request(
             status_code=status.HTTP_409_CONFLICT,
             detail="original text of this record version has been destroyed",
         )
-    # 锁序恒为“版本行 -> 快照行”，与直接发布/公开读取同序，不引入死锁环。
+    # 固定行锁序恒为“版本行 -> 敏感短语清单行 -> 快照行”：其中“清单行 -> 快照行”
+    # 与直接发布及受控批准（申请行 -> 清单行 -> 快照行）严格同序。同一快照上的
+    # 提交与批准并发时只会在清单行或快照行上排队等待，绝不出现一方持快照行等
+    # 清单行、另一方持清单行等快照行的交叉等待，合法操作不会再因数据库死锁失败。
+    # 先在版本行锁之后取清单行锁（持有至本次提交/回滚，核验与提交对应同一已
+    # 提交清单版本），再取快照行锁做撤回/到点计划判定。
+    settings_row = _lock_sensitive_phrase_settings(db)
     existing_snapshot = db.execute(
         select(Snapshot)
         .where(
@@ -977,7 +973,7 @@ def submit_publish_request(
     ).scalar_one_or_none()
     if existing_snapshot is not None:
         # 到点的定时撤回计划先结算，再判定：已永久撤回的版本不能再提交受控申请。
-        # 结算先提交落库，再返回 409。
+        # 结算先提交落库（同时释放清单行/快照行锁），再返回 409。
         _settle_snapshot_withdrawal_plans(db, existing_snapshot, datetime.now(timezone.utc))
         if existing_snapshot.withdrawn_at is not None:
             db.commit()
@@ -996,10 +992,18 @@ def submit_publish_request(
     )
     _validate_window_at_submission(window_close_at)
     frozen_intervals = [dict(iv) for iv in version.intervals]
-    # 提交即须按当前启用清单核验拟发布版本原文：不通过整次拒绝，不产生待审申请。
-    _verify_phrases_cover_text(
-        db, version.original_text, [(iv["start"], iv["end"]) for iv in frozen_intervals]
-    )
+    # 提交即须按当前启用清单（在同一把清单行锁内锁定的已提交版本）核验拟发布
+    # 版本原文：不通过整次回滚，不产生待审申请、快照或令牌；错误只含未覆盖命中
+    # 的码点位置，绝不回显短语或原文。
+    try:
+        _verify_against_settings(
+            settings_row,
+            version.original_text,
+            [(iv["start"], iv["end"]) for iv in frozen_intervals],
+        )
+    except HTTPException:
+        db.rollback()
+        raise
     # 待审内容在此冻结：后续修订只产生新版本，不改变本申请绑定的原文与区间
     request = PublishRequestModel(
         record_id=record_id,

@@ -456,6 +456,193 @@ class ControlledPublishIntegrationTests(unittest.TestCase):
             r = self.client.get(f"/records/{self.record_id}", headers=SERVICE_HEADERS)
             self.assertLessEqual(len(r.json()["snapshots"]), 1)
 
+    # ---- 同一快照上提交与批准并发：固定锁序，不得死锁 ----
+
+    def _snapshot_id_for_record(self):
+        r = self.client.get(f"/records/{self.record_id}", headers=SERVICE_HEADERS)
+        self.assertEqual(r.status_code, 200, r.text)
+        snapshots = r.json()["snapshots"]
+        self.assertEqual(len(snapshots), 1, r.text)
+        return snapshots[0]["snapshot_id"]
+
+    def test_concurrent_submit_and_approve_on_same_snapshot_do_not_deadlock(self):
+        """受控提交先锁快照行后锁清单行的旧锁序与批准（清单行 -> 快照行）交叉死锁。
+
+        通过在提交“已取得快照行锁、尚未请求清单行锁”的位置插桩暂停，确定性
+        制造最坏交错：先放行提交使其停在该位置，再启动批准并给出充分时间取得
+        申请行/清单行并阻塞在快照行上，然后放行提交去请求清单行——
+        - 旧实现：提交持快照行等清单行、批准持清单行等快照行，PostgreSQL 检出
+          死锁并中止其中一个合法事务（500）；
+        - 新实现：提交按“版本行 -> 清单行 -> 快照行”持锁（暂停时清单行已在其
+          手中），批准在清单行排队；提交先完成释放后批准顺序完成，双方均成功。
+        """
+        from unittest import mock
+
+        self._mark_controlled()
+        # 先经一份申请的批准产生该 (record, version) 的快照，使随后的新提交在
+        # 快照行上等待、批准也复用同一快照行。
+        first = self._submit()
+        first_id = first.json()["request_id"]
+        approved = self.client.post(
+            f"/publish-requests/{first_id}/approve", auth=BASIC_BOB
+        )
+        self.assertEqual(approved.status_code, 200, approved.text)
+        snapshot_id = self._snapshot_id_for_record()
+        # 待审的第二份申请：其批准会走“申请行 -> 清单行 -> 快照行”
+        pending = self._submit()
+        pending_id = pending.json()["request_id"]
+
+        role = threading.local()
+        submit_paused = threading.Event()
+        release_submit = threading.Event()
+        real_settle = app_main._settle_snapshot_withdrawal_plans
+
+        def gated_settle(db, snapshot, now):
+            # 提交在快照行锁内、下一步就要请求清单行锁（旧实现）——
+            # 新实现此刻清单行锁也已持有；两种实现都在此汇合，便于统一编排。
+            if getattr(role, "name", None) == "submit":
+                submit_paused.set()
+                self.assertTrue(
+                    release_submit.wait(timeout=10),
+                    "提交未能在预期时间内到达快照行锁后的暂停点",
+                )
+            return real_settle(db, snapshot, now)
+
+        results = {}
+
+        def do_submit():
+            role.name = "submit"
+            client = TestClient(app_main.app, raise_server_exceptions=False)
+            try:
+                r = client.post(
+                    f"/records/{self.record_id}/publish-requests",
+                    auth=BASIC_ALICE,
+                    json={"version": 1, "max_reads": 1},
+                )
+                results["submit"] = r.status_code
+            except Exception as exc:  # 死锁受害者会以数据库错误透出
+                results["submit"] = f"error: {exc!r}"
+
+        def do_approve():
+            role.name = "approve"
+            client = TestClient(app_main.app, raise_server_exceptions=False)
+            try:
+                r = client.post(
+                    f"/publish-requests/{pending_id}/approve", auth=BASIC_BOB
+                )
+                results["approve"] = r.status_code
+            except Exception as exc:  # 死锁受害者会以数据库错误透出
+                results["approve"] = f"error: {exc!r}"
+
+        with mock.patch.object(
+            app_main, "_settle_snapshot_withdrawal_plans", side_effect=gated_settle
+        ):
+            t_submit = threading.Thread(target=do_submit)
+            t_submit.start()
+            # 提交先取得版本行/快照行（旧实现）或版本行/清单行/快照行（新实现）
+            self.assertTrue(submit_paused.wait(timeout=10), "提交未到达暂停点")
+            t_approve = threading.Thread(target=do_approve)
+            t_approve.start()
+            # 给批准充分时间：旧实现下取得申请行 + 清单行后阻塞在快照行上，
+            # 形成“双方各持一把、互等另一把”的交叉等待；新实现下批准在清单行
+            # 排队（清单行由提交持有），不会形成环。
+            time.sleep(1.5)
+            release_submit.set()
+            t_submit.join(timeout=30)
+            t_approve.join(timeout=30)
+            self.assertFalse(t_submit.is_alive(), "提交线程挂起（疑似死锁未解除）")
+            self.assertFalse(t_approve.is_alive(), "批准线程挂起（疑似死锁未解除）")
+
+        # 修复后：两个原本合法的操作都成功，任一 500 都说明锁序环仍在
+        self.assertEqual(results, {"submit": 201, "approve": 200}, results)
+        # 终态落库正确：第二份申请已批准并绑定该既有快照，新申请保持待审，
+        # 同一快照只此一份，且两笔操作各签发了一枚令牌。
+        info = self.client.get(
+            f"/publish-requests/{pending_id}", auth=BASIC_ALICE
+        ).json()
+        self.assertEqual(info["status"], "approved")
+        self.assertEqual(info["snapshot_id"], snapshot_id)
+        requests_list = self.client.get(
+            f"/records/{self.record_id}/publish-requests", auth=BASIC_ALICE
+        ).json()["requests"]
+        statuses = sorted(item["status"] for item in requests_list)
+        self.assertEqual(statuses, ["approved", "approved", "pending"])
+        self.assertEqual(self._snapshot_id_for_record(), snapshot_id)
+
+    def test_repeated_concurrent_submit_approve_pairs_all_succeed(self):
+        """不加插桩的压力交错：多对“提交 + 批准”并发，绝不出现死锁 500。"""
+        self._mark_controlled()
+        approved = self.client.post(
+            f"/publish-requests/{self._submit().json()['request_id']}/approve",
+            auth=BASIC_BOB,
+        )
+        self.assertEqual(approved.status_code, 200, approved.text)
+        self._snapshot_id_for_record()
+
+        pair_count = 8
+        barrier = threading.Barrier(pair_count * 2)
+        results: list[tuple[str, int]] = []
+
+        def submit_once(idx):
+            barrier.wait()
+            client = TestClient(app_main.app, raise_server_exceptions=False)
+            try:
+                r = client.post(
+                    f"/records/{self.record_id}/publish-requests",
+                    auth=BASIC_ALICE,
+                    json={"version": 1, "max_reads": idx + 1},
+                )
+                code_ = r.status_code
+            except Exception as exc:
+                code_ = f"error: {exc!r}"
+            results.append((f"submit-{idx}", code_))
+
+        def approve_once(idx, request_id):
+            barrier.wait()
+            client = TestClient(app_main.app, raise_server_exceptions=False)
+            try:
+                r = client.post(
+                    f"/publish-requests/{request_id}/approve",
+                    auth=BASIC_BOB,
+                )
+                code_ = r.status_code
+            except Exception as exc:
+                code_ = f"error: {exc!r}"
+            results.append((f"approve-{idx}", code_))
+
+        threads = []
+        pending_ids = []
+        for i in range(pair_count):
+            # 每对先备一份待审申请供批准使用（在并发放行前预先编号）
+            pending_ids.append(self._submit().json()["request_id"])
+            threads.append(
+                threading.Thread(target=approve_once, args=(i, pending_ids[-1]))
+            )
+            threads.append(threading.Thread(target=submit_once, args=(i,)))
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+            self.assertFalse(t.is_alive(), "存在挂起线程（疑似数据库死锁）")
+        self.assertEqual(len(results), pair_count * 2)
+        statuses = sorted(code for _, code in results)
+        self.assertEqual(
+            statuses, [200] * pair_count + [201] * pair_count, results
+        )
+        # 恰好一个快照；无 500 即证明并发交错未触发死锁
+        record = self.client.get(
+            f"/records/{self.record_id}", headers=SERVICE_HEADERS
+        ).json()
+        self.assertEqual(len(record["snapshots"]), 1)
+        # 8 份预先待审申请全部批准；8 份并发新提交保持待审
+        listed = self.client.get(
+            f"/records/{self.record_id}/publish-requests", auth=BASIC_ALICE
+        ).json()["requests"]
+        status_counts: dict[str, int] = {}
+        for item in listed:
+            status_counts[item["status"]] = status_counts.get(item["status"], 0) + 1
+        self.assertEqual(status_counts, {"approved": 9, "pending": 8}, status_counts)
+
     # ---- 既有接口兼容性（非受控记录） ----
 
     def test_legacy_flow_unchanged_on_non_controlled_record(self):
