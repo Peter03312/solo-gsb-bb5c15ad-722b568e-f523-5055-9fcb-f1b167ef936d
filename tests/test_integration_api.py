@@ -9,6 +9,7 @@
 
 import json
 import os
+import sys
 import threading
 import time
 import unittest
@@ -6182,6 +6183,361 @@ class SnapshotWithdrawalPlanIntegrationTests(unittest.TestCase):
         # 到点结算仍生效（共享测试库中其他用例的到期计划也可能在本轮被终结）
         self.assertGreaterEqual(self._settle(target + timedelta(seconds=1)), 1)
         self.assertEqual(self._get_plan(plan["plan_id"]).json()["status"], "completed")
+
+
+class ControlledSubmitApproveLockOrderIntegrationTests(unittest.TestCase):
+    """受控申请提交与批准的固定锁序：同一快照并发不得死锁。
+
+    旧实现中，提交按“版本行 → 快照行 → 敏感短语清单行”加锁，批准按
+    “申请行 → 清单行 → 快照行”加锁：两条流程在（清单行，快照行）上锁序
+    相反，并发交错时形成等待环，PostgreSQL 死锁检测会中止其中一方，使原本
+    合法的操作以 500 失败。修复后两条流程统一为“清单行先于快照行”。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        app_main._init_db_with_retry()
+        cls.client = TestClient(app_main.app)
+        cls.client.__enter__()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.client.__exit__(None, None, None)
+
+    def setUp(self):
+        # 初始停用短语核验：让本类用例专注于锁序本身
+        self.client.put(
+            "/sensitive-phrases", headers=SERVICE_HEADERS, json={"phrases": []}
+        )
+        r = self.client.post(
+            "/records",
+            headers=SERVICE_HEADERS,
+            json={"text": TEXT_V1, "intervals": INTERVALS_V1},
+        )
+        self.assertEqual(r.status_code, 201, r.text)
+        self.record_id = r.json()["record_id"]
+        r = self.client.put(
+            f"/records/{self.record_id}/controlled", headers=SERVICE_HEADERS
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+
+    def _create_pending_request(self, body=None):
+        r = self.client.post(
+            f"/records/{self.record_id}/publish-requests",
+            auth=BASIC_ALICE,
+            json=body or {"version": 1},
+        )
+        self.assertEqual(r.status_code, 201, r.text)
+        return r.json()["request_id"]
+
+    # ---- 同快照提交与批准并发交错：无死锁，两者都成功 ----
+
+    def test_concurrent_submit_and_approve_on_same_snapshot_do_not_deadlock(self):
+        """确定性制造旧实现的等待环；修复后双方都按既有成功语义完成。
+
+        协调点：提交线程在“取得清单行锁之前”短暂挂起（旧实现此刻已持快照行、
+        新实现此刻只持版本行），让批准先取得清单行并进入快照行锁等待，再放行提交：
+        - 旧实现：提交持快照行等待清单行、批准持清单行等待快照行 → 死锁，
+          PostgreSQL 中止一方并对其返回 500；
+        - 修复后：两条流程统一为“清单行先于快照行”，无等待环，两者均成功。
+        """
+        # 先批准一条申请产生同版本快照 S（死锁环的前提：快照行已存在）：
+        # 既有快照 S 之后，alice 再留一份待审申请 PR1 供批准并发使用。
+        seed_request_id = self._create_pending_request()
+        seed = self.client.post(
+            f"/publish-requests/{seed_request_id}/approve", auth=BASIC_BOB
+        )
+        self.assertEqual(seed.status_code, 200, seed.text)
+        approve_request_id = self._create_pending_request()
+
+        original_lock = app_main._lock_sensitive_phrase_settings
+        submit_parked = threading.Event()
+        release_submit = threading.Event()
+
+        def submit_concurrently():
+            client = TestClient(app_main.app)
+            r = client.post(
+                f"/records/{self.record_id}/publish-requests",
+                auth=BASIC_CAROL,  # 与批准人 bob 不同，避免自审 403
+                json={"version": 1},
+            )
+            result["submit_status"] = r.status_code
+            result["submit_body"] = r.json()
+
+        def approve_concurrently():
+            client = TestClient(app_main.app)
+            r = client.post(
+                f"/publish-requests/{approve_request_id}/approve", auth=BASIC_BOB
+            )
+            result["approve_status"] = r.status_code
+            result["approve_body"] = r.json()
+
+        result = {}
+
+        def in_submit_endpoint():
+            frame = sys._getframe()
+            while frame is not None:
+                if frame.f_code.co_name == "submit_publish_request":
+                    return True
+                frame = frame.f_back
+            return False
+
+        # TestClient 把端点放在独立 portal 线程执行（线程名/线程局部变量都不可靠），
+        # 故按调用栈识别提交端点：提交线程在取清单行锁前挂起；批准线程取到清单行
+        # 后额外停留一个窗口，确保它走到快照行锁等待，再放行提交形成旧实现的交错。
+        def named_lock(db):
+            if in_submit_endpoint():
+                submit_parked.set()
+                self.assertTrue(release_submit.wait(timeout=10), "提交线程未被及时放行")
+            row = original_lock(db)
+            if not in_submit_endpoint():
+                time.sleep(1.0)
+            return row
+
+        def submit_concurrently():
+            client = TestClient(app_main.app)
+            r = client.post(
+                f"/records/{self.record_id}/publish-requests",
+                auth=BASIC_CAROL,  # 与批准人 bob 不同，避免自审 403
+                json={"version": 1},
+            )
+            result["submit_status"] = r.status_code
+            result["submit_body"] = r.json()
+
+        app_main._lock_sensitive_phrase_settings = named_lock
+        submit_thread = threading.Thread(target=submit_concurrently)
+        try:
+            submit_thread.start()
+            self.assertTrue(submit_parked.wait(timeout=5), "提交线程未到达协调点")
+            approve_thread = threading.Thread(target=approve_concurrently)
+            approve_thread.start()
+            # 给批准线程取得申请行、清单行并走到快照行锁等待留出窗口
+            time.sleep(1.3)
+            release_submit.set()
+            submit_thread.join(timeout=20)
+            approve_thread.join(timeout=20)
+        finally:
+            app_main._lock_sensitive_phrase_settings = original_lock
+        self.assertFalse(submit_thread.is_alive(), "提交线程因死锁悬挂")
+        self.assertFalse(approve_thread.is_alive(), "批准线程因死锁悬挂")
+        # 关键断言：任何一方都不允许因死锁失败
+        self.assertEqual(
+            result.get("submit_status"), 201, result.get("submit_body")
+        )
+        self.assertEqual(
+            result.get("approve_status"), 200, result.get("approve_body")
+        )
+        # 批准签发的令牌可立即公开读取（成功响应、公开读取约定不变）
+        token = result["approve_body"]["token"]
+        snapshot_id = result["approve_body"]["snapshot_id"]
+        read = self.client.get(f"/public/snapshots/{snapshot_id}?token={token}")
+        self.assertEqual(read.status_code, 200, read.text)
+        # 新提交的申请保持待审、可由另一名复核人批准/驳回
+        new_request_id = result["submit_body"]["request_id"]
+        info = self.client.get(
+            f"/publish-requests/{new_request_id}", auth=BASIC_ALICE
+        ).json()
+        self.assertEqual(info["status"], "pending")
+
+    # ---- 已撤回快照（含定时计划到点）：先按现有规则结算再 409 ----
+
+    def test_submit_settles_due_plan_then_conflicts_and_leaves_no_half_state(self):
+        """等锁期间定时计划到点：提交获锁后先结算（预定时刻/原因），再 409。"""
+        from app.db import SessionLocal
+        from app.models import PublishRequest as PRModel
+
+        # 先有一枚已发布快照（批准一条申请）
+        approved_id = self._create_pending_request()
+        approve = self.client.post(
+            f"/publish-requests/{approved_id}/approve", auth=BASIC_BOB
+        )
+        self.assertEqual(approve.status_code, 200, approve.text)
+        sid = approve.json()["snapshot_id"]
+        # 安排一个很快到点的计划，并停掉后台结算线程：只能由提交路径在快照行锁内结算
+        target = datetime.now(timezone.utc) + timedelta(milliseconds=400)
+        plan = self.client.post(
+            "/snapshot-withdrawal-plans",
+            headers=SERVICE_HEADERS,
+            json={
+                "snapshot_id": sid,
+                "scheduled_at": _iso(target),
+                "reason": "提交等锁期间到点撤回",
+            },
+        )
+        self.assertEqual(plan.status_code, 201, plan.text)
+        plan_id = plan.json()["plan_id"]
+
+        original_lock = app_main._lock_sensitive_phrase_settings
+        proceed = threading.Event()
+
+        def slow_lock(db):
+            row = original_lock(db)
+            # 持有清单行锁跨过计划到点：快照行锁必须在获锁后惰性结算
+            proceed.wait(timeout=5)
+            return row
+
+        def submit():
+            client = TestClient(app_main.app)
+            r = client.post(
+                f"/records/{self.record_id}/publish-requests",
+                auth=BASIC_ALICE,
+                json={"version": 1},
+            )
+            result["status"] = r.status_code
+            result["body"] = r.json()
+
+        result = {}
+        app_main._withdrawal_scheduler.stop()
+        app_main._lock_sensitive_phrase_settings = slow_lock
+        try:
+            t = threading.Thread(target=submit)
+            t.start()
+            # 等提交线程已持有清单行锁并停在 proceed 上（跨过到点时刻）
+            time.sleep(1.0)
+            proceed.set()
+            t.join(timeout=15)
+        finally:
+            app_main._lock_sensitive_phrase_settings = original_lock
+            app_main._withdrawal_scheduler.start()
+        self.assertFalse(t.is_alive())
+        self.assertEqual(result["status"], 409, result["body"])
+        # 计划按预定时刻/原因完成撤回
+        plan_info = self.client.get(
+            f"/snapshot-withdrawal-plans/{plan_id}", headers=SERVICE_HEADERS
+        ).json()
+        self.assertEqual(plan_info["status"], "completed")
+        snapshot_info = self.client.get(
+            f"/records/{self.record_id}", headers=SERVICE_HEADERS
+        ).json()["snapshots"][0]
+        self.assertEqual(snapshot_info["status"], "withdrawn")
+        self.assertEqual(snapshot_info["withdraw_reason"], "提交等锁期间到点撤回")
+        # 不留下新的待审申请（原有 1 条已批准申请之外没有新增）
+        with SessionLocal() as session:
+            pending_count = (
+                session.query(PRModel)
+                .filter(
+                    PRModel.record_id == self.record_id,
+                    PRModel.status == "pending",
+                )
+                .count()
+            )
+        self.assertEqual(pending_count, 0)
+
+    # ---- 短语未完整遮蔽：沿用 422，不留下申请/快照/令牌半成品 ----
+
+    def test_submit_uncovered_phrase_is_rejected_without_half_state(self):
+        from app.db import SessionLocal
+        from app.models import (
+            PublishRequest as PRModel,
+            ReadToken as TokenModel,
+            Snapshot as SnapshotModel,
+        )
+
+        self.client.put(
+            "/sensitive-phrases", headers=SERVICE_HEADERS, json={"phrases": ["患者"]}
+        )
+        # “患者”命中 [0,2)，而提交版本的遮蔽区间从 [2,4) 起：未覆盖
+        r = self.client.post(
+            f"/records/{self.record_id}/publish-requests",
+            auth=BASIC_ALICE,
+            json={"version": 1},
+        )
+        self.assertEqual(r.status_code, 422, r.text)
+        self.assertEqual(r.json()["detail"]["hits"], [{"start": 0, "end": 2}])
+        self.assertNotIn("患者", r.text)
+        with SessionLocal() as session:
+            self.assertEqual(
+                session.query(PRModel)
+                .filter(PRModel.record_id == self.record_id)
+                .count(),
+                0,
+            )
+            self.assertEqual(
+                session.query(SnapshotModel)
+                .filter(SnapshotModel.record_id == self.record_id)
+                .count(),
+                0,
+            )
+            self.assertEqual(
+                session.query(TokenModel)
+                .join(SnapshotModel, TokenModel.snapshot_id == SnapshotModel.id)
+                .filter(SnapshotModel.record_id == self.record_id)
+                .count(),
+                0,
+            )
+        # 停用核验后重试成功，证明未残留半完成状态
+        self.client.put(
+            "/sensitive-phrases", headers=SERVICE_HEADERS, json={"phrases": []}
+        )
+        retry = self.client.post(
+            f"/records/{self.record_id}/publish-requests",
+            auth=BASIC_ALICE,
+            json={"version": 1},
+        )
+        self.assertEqual(retry.status_code, 201, retry.text)
+
+    # ---- 版本原文已销毁：沿用 409，不留下申请 ----
+
+    def test_submit_after_original_destroyed_conflicts_without_half_state(self):
+        from app.db import SessionLocal
+        from app.models import PublishRequest as PRModel
+
+        rid = self.client.post(
+            f"/records/{self.record_id}/versions/1/destroy-original",
+            headers=SERVICE_HEADERS,
+            json={"reason": "该版本原文不应留存"},
+        )
+        self.assertEqual(rid.status_code, 200, rid.text)
+        r = self.client.post(
+            f"/records/{self.record_id}/publish-requests",
+            auth=BASIC_ALICE,
+            json={"version": 1},
+        )
+        self.assertEqual(r.status_code, 409, r.text)
+        with SessionLocal() as session:
+            self.assertEqual(
+                session.query(PRModel)
+                .filter(PRModel.record_id == self.record_id)
+                .count(),
+                0,
+            )
+
+    # ---- 批准仍按获锁当时启用的清单重新核验冻结内容 ----
+
+    def test_approve_rechecks_frozen_content_against_current_settings_version(self):
+        # 提交时停用核验、遮蔽区间不覆盖“机密”
+        rid = self.client.post(
+            "/records",
+            headers=SERVICE_HEADERS,
+            json={"text": "受控机密内容。", "intervals": [{"start": 2, "end": 4}]},
+        ).json()["record_id"]
+        self.client.put(f"/records/{rid}/controlled", headers=SERVICE_HEADERS)
+        self.client.put(
+            "/sensitive-phrases", headers=SERVICE_HEADERS, json={"phrases": []}
+        )
+        submitted = self.client.post(
+            f"/records/{rid}/publish-requests",
+            auth=BASIC_ALICE,
+            json={"version": 1},
+        )
+        self.assertEqual(submitted.status_code, 201, submitted.text)
+        prid = submitted.json()["request_id"]
+        # 批准前启用清单：“受控”命中 [0,2) 未被遮蔽 → 按当时清单重新核验失败
+        self.client.put(
+            "/sensitive-phrases", headers=SERVICE_HEADERS, json={"phrases": ["受控"]}
+        )
+        approve = self.client.post(
+            f"/publish-requests/{prid}/approve", auth=BASIC_BOB
+        )
+        self.assertEqual(approve.status_code, 422, approve.text)
+        self.assertEqual(approve.json()["detail"]["hits"], [{"start": 0, "end": 2}])
+        # 申请仍待审、可驳回；无快照/令牌
+        info = self.client.get(f"/publish-requests/{prid}", auth=BASIC_ALICE).json()
+        self.assertEqual(info["status"], "pending")
+        record_state = self.client.get(
+            f"/records/{rid}", headers=SERVICE_HEADERS
+        ).json()
+        self.assertEqual(record_state["snapshots"], [])
 
 
 if __name__ == "__main__":

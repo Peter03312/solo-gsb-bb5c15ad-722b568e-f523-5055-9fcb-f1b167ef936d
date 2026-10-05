@@ -808,6 +808,41 @@ curl -sS http://localhost:8000/records/<RID>/publish-requests -u alice:alice-pw
 ./examples/demo_controlled.sh   # 可用 BASE_URL / SERVICE_KEY / ALICE_PW / BOB_PW / CAROL_PW 覆盖
 ```
 
+### 提交与批准的行锁顺序（同一快照并发不死锁）
+
+同一快照（同记录同版本）上的受控申请提交与另一份待审申请的批准可能完全并发。两条流程按**相同的固定锁序**取锁，任何交错都不会形成等待环：
+
+| 流程 | 行锁顺序（前缀为各自特有锁） |
+| --- | --- |
+| 提交申请 `POST /records/{id}/publish-requests` | **版本行 → 敏感短语清单行 → 快照行** |
+| 批准申请 `POST /publish-requests/{id}/approve` | **申请行 → 敏感短语清单行 → 快照行** |
+| 直接发布 `POST /records/{id}/publish` | **版本行 → 敏感短语清单行 → 快照行** |
+
+- **旧实现的缺陷**：提交先锁快照行、再锁清单行；批准先锁清单行、再锁快照行。两者并发交错时形成“提交持快照等清单、批准持清单等快照”的 AB-BA 等待环，PostgreSQL 死锁检测会中止其中一方，使原本合法的操作以数据库错误失败。
+- **修复**：提交调整为**先锁清单行、再锁快照行**，与批准及直接发布同序；版本行/申请行分别是两条流程在此之前的第一把锁，互不交叉。所有流程在（清单行，快照行）上严格同序，死锁环不复存在。
+- **语义不变（仅调整取锁先后）**：
+  - **提交**仍按**同一已提交清单版本**核验拟发布版本原文与遮蔽区间并冻结内容——清单行锁从核验前持有到本次提交/回滚，等待期间清单被替换则获锁后按新版本核验；短语命中未被完整遮蔽沿用原有 `422`（只回未覆盖命中码点），整次回滚，**不留下申请、快照或令牌**。
+  - **批准**仍按**获锁当时启用的清单**对申请冻结的原文与区间重新核验；不通过时申请保持待审、仍可驳回。
+  - **已撤回快照**（含等锁期间定时撤回计划到点）仍由后取快照行锁的一方在锁内先按**预定时刻与计划原因**结算到点计划，再沿用原有 `409` 拒绝；提交不产生待审申请，批准不签发令牌。
+  - **版本原文已销毁**沿用原有 `409`，同样不留下申请/快照/令牌半成品。
+  - 无冲突时成功响应、HTTP Basic/服务密钥鉴权与公开读取约定**完全不变**；启动方式、环境变量与数据库升级链（仍为 v8，无结构变更）不变。
+
+```bash
+# 并发交错（不同操作者、各自凭据）：两者都必须成功，不再有一方因数据库死锁失败
+curl -sS -X POST http://localhost:8000/records/<RID>/publish-requests \
+  -u carol:carol-pw -H "Content-Type: application/json" -d '{"version":1}' &   # 新提交
+curl -sS -X POST http://localhost:8000/publish-requests/<PRID>/approve -u bob:bob-pw &  # 批准既有待审申请
+wait
+# => 提交 201（新申请 pending）；批准 200（同事务快照 + 新令牌），新令牌可立即公开读取
+```
+
+确定性行锁交错的回归测试见 `ControlledSubmitApproveLockOrderIntegrationTests`（真实 PostgreSQL 行锁等待）：
+
+```bash
+python3 -m unittest \
+  tests.test_integration_api.ControlledSubmitApproveLockOrderIntegrationTests -v
+```
+
 ### 状态码约定（受控接口）
 
 | 场景 | 状态码 |
